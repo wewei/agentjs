@@ -1,5 +1,6 @@
 import { type OpenAI } from "openai";
 import { type Tool } from "./tools";
+import { defaultSystemPrompt } from "./prompts";
 
 export type AgentOutputChunk = NewIteration | ToolCallRequest | ToolCallResponse | TextChunk;
 
@@ -38,73 +39,69 @@ export type TextChunk = {
 
 const textChunk = (content: string): TextChunk => ({ type: TEXT_CHUNK, content });
 
-const runIteration = async function *({
-  openAI,
-  params,
-}: {
+/**
+ * Collect tool call request segments in each chunk, and combine them into complete tool call requests
+ * @param toolCallRequests tool call request list
+ * @param deltaToolCalls tool call request
+ * @returns tool call request list
+ */
+const collectToolCallRequests = (
+  toolCallRequests: ToolCallRequest[],
+  deltaToolCalls: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta.ToolCall[],
+): ToolCallRequest[] => {
+  for (const toolCall of deltaToolCalls) {
+    const { index, id, function: { name = "", arguments: args = "" } = {} } = toolCall;
+    if (id) {
+      toolCallRequests[index] = toolCallRequest(id, name, args);
+    } else if (index < toolCallRequests.length && toolCallRequests[index]) {
+      toolCallRequests[index].name += name;
+      toolCallRequests[index].arguments += args;
+    }
+  }
+  return toolCallRequests;
+}
+
+/**
+ * Run an agentic iteration
+ * @param openAI openai client
+ * @param params openai completion params
+ * @yields text chunks
+ * @returns tool call request list
+ */
+const runAgenticIteration = async function* (
   openAI: OpenAI,
   params: OpenAI.ChatCompletionCreateParams
-}): AsyncGenerator<TextChunk | ToolCallRequest> {
-  const response = await openAI.chat.completions.create({
+): AsyncGenerator<string, ToolCallRequest[], void> {
+  const toolCallRequests: ToolCallRequest[] = [];
+
+  for await (const chunk of await openAI.chat.completions.create({
     ...params,
     stream: true,
-  });
-
-  const toolCallRequests = new Map<number, ToolCallRequest>();
-
-  for await (const chunk of response) {
+  })) {
     const delta = chunk.choices[0]?.delta;
-    if (!delta) {
-      continue;
+    if (delta?.content) {
+      yield delta.content;
     }
-    if (delta.content) {
-      yield textChunk(delta.content);
-    }
-    if (delta.tool_calls) {
-      for (const toolCall of delta.tool_calls) {
-        if (toolCall.id) {
-          toolCallRequests.set(
-            toolCall.index,
-            toolCallRequest(
-              toolCall.id,
-              toolCall.function?.name ?? "",
-              toolCall.function?.arguments ?? ""
-            )
-          );
-        } else {
-          const request = toolCallRequests.get(toolCall.index);
-          if (request) {
-            if (toolCall.function) {
-              request.name += toolCall.function.name ?? '';
-              request.arguments += toolCall.function.arguments ?? '';
-            }
-          } else {
-            console.error("Tool call request not found");
-          }
-        }
-      }
-    }
+    collectToolCallRequests(toolCallRequests, delta?.tool_calls ?? []);
   }
-
-  for (const request of toolCallRequests.values()) {
-    yield request;
-  }
+  return toolCallRequests;
 }
+
 
 export const makeAgent = ({
   tools,
   model,
   openAI,
-  systemPrompt,
+  systemPrompt = defaultSystemPrompt,
 }: {
   tools: Tool[],
   model: string,
   openAI: OpenAI,
-  systemPrompt: string,
+  systemPrompt?: string,
 }) => async function * (message: string): AsyncGenerator<AgentOutputChunk> {
-  // 初始化消息历史
+  // Initialize message history
   const messages: OpenAI.ChatCompletionMessageParam[] = [
-    { role: "system", content: "Please answer the following user question based on the user's language. You can make tool calls to get information. Please also tell what you want to do when you are making a tool call. If a tool call fails, you can try another way, don't give up too soon." },
+    { role: "system", content: systemPrompt },
     { role: "user", content: message }
   ];
 
@@ -124,52 +121,54 @@ export const makeAgent = ({
 
     yield newIteration();
 
-    const chunks = runIteration({
+    const chunks = runAgenticIteration(
       openAI,
-      params: tools.length > 0 ? {
+      tools.length > 0 ? {
         model,
         messages,
         tools: tools.map(tool => tool.definition),
         tool_choice: "auto",
+        parallel_tool_calls: true,
       } : {
         model,
         messages,
       }
-    });
+    );
 
     messages.push(assistantMessage);
 
     hasMoreIterations = false;
 
     for await (const chunk of chunks) {
-      if (chunk.type === TEXT_CHUNK) {
-        assistantMessage.content += chunk.content;
-        yield chunk;
-      }
-      if (chunk.type === TOOL_CALL_REQUEST) {
-        hasMoreIterations = true;
-        yield toolCallRequest(chunk.id, chunk.name, chunk.arguments);
-        const tool = toolMap[chunk.name];
-        if (tool) {
-          if (!assistantMessage.tool_calls) {
-            assistantMessage.tool_calls = [];
-          }
-          assistantMessage.tool_calls.push({
-            id: chunk.id,
-            type: "function",
-            function: {
-              name: chunk.name,
-              arguments: chunk.arguments,
-            }
-          });
-          const result = await tool.call(chunk.arguments);
-          messages.push({
-            role: "tool",
-            content: result,
-            tool_call_id: chunk.id,
-          });
-          yield toolCallResponse(chunk.id, result);
+      assistantMessage.content += chunk;
+      yield textChunk(chunk);
+    }
+
+    const toolCallRequests = (await chunks.next()).value as ToolCallRequest[];
+
+    for (const toolCallRequest of toolCallRequests) {
+      hasMoreIterations = true;
+      yield toolCallRequest;
+      const tool = toolMap[toolCallRequest.name];
+      if (tool) {
+        if (!assistantMessage.tool_calls) {
+          assistantMessage.tool_calls = [];
         }
+        assistantMessage.tool_calls.push({
+          id: toolCallRequest.id,
+          type: "function",
+          function: {
+            name: toolCallRequest.name,
+            arguments: toolCallRequest.arguments,
+          }
+        });
+        const result = await tool.call(toolCallRequest.arguments);
+        messages.push({
+          role: "tool",
+          content: result,
+          tool_call_id: toolCallRequest.id,
+        });
+        yield toolCallResponse(toolCallRequest.id, result);
       }
     }
   }
