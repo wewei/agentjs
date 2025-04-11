@@ -4,15 +4,13 @@
   "module": "index.ts",
   "type": "module",
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "openai": "^4.90.0"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
   "dependencies": {
-    "js-sha256": "^0.11.0",
-    "openai": "^4.90.0",
-    "zod": "^3.24.2",
-    "zod-to-json-schema": "^3.24.5"
+    "js-sha256": "^0.11.0"
   }
 }

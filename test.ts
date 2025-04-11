@@ -1,4 +1,3 @@
-import { z } from "zod";
 import {
   makeAgent,
   NEW_ITERATION,
@@ -8,7 +7,7 @@ import {
 } from "./index";
 import { OpenAI } from "openai";
 import vm from "node:vm";
-import { makeTool } from "./tools";
+import { makeTool, schema } from "./tools";
 
 const openAI = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -19,8 +18,14 @@ const tools = [
   makeTool({
     name: "execute_script",
     description: "Execute JavaScript code in sandbox without network access, write the result to the global variable 'result', you can write code to get the information you need",
-    schema: z.object({
-      script: z.string(),
+    schema: schema({
+      type: "object",
+      properties: {
+        script: {
+          type: "string",
+        },
+      },
+      required: ["script"],
     }),
     call: async ({ script }) => {
       const context: { result: string | null } = { result: null };
